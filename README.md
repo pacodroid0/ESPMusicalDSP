@@ -6,7 +6,7 @@ The system acts as a pre-amplifier/processor for Class-T (e.g., TA2024) or Class
 
 ---
 
-## 🚀 Key Features (Firmware v2.0)
+## 🚀 Key Features (Firmware v1.0)
 
 ### 🎧 Inputs & Sources
 
