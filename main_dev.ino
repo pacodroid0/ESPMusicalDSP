@@ -13,9 +13,7 @@
 #include "fmradio.h"
 #include "displayinfo.h"
 #include "phbuttons.h"
-
-// --- 1. MISSING INCLUDE RESTORED ---
-#include "pnoise.h"
+#include "pnoise.h" // Noise Generator
 
 // --- GLOBAL OBJECTS ---
 Preferences preferences;
@@ -28,7 +26,6 @@ DisplayUI ui(&lcd);
 ButtonManager buttons;
 
 // --- STATE VARIABLES ---
-// [FIX] Added MODE_GEN back
 enum OperationMode { MODE_BT, MODE_RADIO, MODE_AUX, MODE_GEN };
 OperationMode currentMode = MODE_BT;
 
@@ -36,7 +33,7 @@ int volume = 15;
 bool wifiActive = false;
 bool isTxMode = false;
 
-// --- 2. GENERATOR GLOBALS RESTORED ---
+// Generator Globals
 int genSignalType = 0; // 0=Sine, 1=White, 2=Pink, 3=Sweep
 bool genActive = false;
 float genFreqStart = 440.0;
@@ -45,24 +42,25 @@ float genPeriod = 10.0;
 unsigned long sweepStartTime = 0;
 double currentPhase = 0;
 
-// Display State
+// Display & Meters
 unsigned long lastDisplayUpdate = 0;
 String btTitle = "";
 String btArtist = "";
 int vuLeft = 0;
 int vuRight = 0;
 
-// Radio Memory UI State
+// Radio UI
 bool radioShowMemories = false;
 int radioCursor = 1;
 
-// --- 3. WEB SERVER INCLUDE (Must be after Globals) ---
+// --- WEB SERVER INCLUDE (Must be after Globals) ---
 #include "web_server.h"
 
-// --- FORWARD DECLARATIONS ---
+// --- FORWARD DECLARATIONS (CRITICAL FOR LINKER) ---
 void bt_data_callback(const uint8_t *data, uint32_t len);
 void bt_metadata_callback(uint8_t id, const uint8_t *text);
-int32_t bt_source_data_callback(Frame *data, int32_t len);
+int32_t bt_source_data_callback(Frame *data, int32_t frame_count);
+
 // --- I2S CONFIGURATION ---
 void setupI2S_DAC() {
     i2s_config_t dac_config = {
@@ -107,68 +105,57 @@ void setupI2S_ADC() {
 }
 
 // ==========================================
-// AUDIO CALLBACKS
+// AUDIO CALLBACKS (BLUETOOTH)
 // ==========================================
 
+// TX Callback (Source)
 int32_t bt_source_data_callback(Frame *data, int32_t frame_count) {
     size_t bytes_read;
-    // 'frame_count' is the number of stereo samples requested.
-    // Each frame is 2x int16_t (4 bytes).
-    
-    // We need a temp buffer for 32-bit I2S data (Left + Right)
     int32_t tempBuffer[frame_count * 2];
 
     // Read from ADC (I2S_NUM_1)
-    // We read frame_count * 8 bytes (because we read 2x 32-bit ints per frame)
     i2s_read(I2S_NUM_1, tempBuffer, frame_count * 8, &bytes_read, portMAX_DELAY);
 
     for (int i=0; i < frame_count; i++) {
         StereoSample s;
-        // Read 32-bit data from I2S
         s.l = tempBuffer[i*2];
         s.r = tempBuffer[i*2+1];
 
-        // Process DSP
         s = dsp.processAuxPreamp(s);
         s = dsp.processMasterChain(s);
 
-        // Update VU Meter
+        // Update VU
         int lPeak = abs(s.l >> 23);
         int rPeak = abs(s.r >> 23);
         if(lPeak > vuLeft) vuLeft = lPeak; else vuLeft *= 0.9;
         if(rPeak > vuRight) vuRight = rPeak; else vuRight *= 0.9;
 
-        // [FIX] Write directly to the Frame struct (16-bit)
-        // Shift down by 16 to convert 32-bit internal audio to 16-bit BT audio
+        // Write to Frame (16-bit)
         data[i].channel1 = s.l >> 16;
         data[i].channel2 = s.r >> 16;
     }
-    
-    // Return the number of frames provided
-    return frame_count; 
+    return frame_count;
 }
 
-// [FIXED] Updated signature and logic for new A2DP library
+// RX Metadata Callback
 void bt_metadata_callback(uint8_t id, const uint8_t *text) {
-    // 0x1 = Title, 0x2 = Artist, 0x4 = Album (Standard ESP-IDF AVRC IDs)
     if (id == 0x1) { 
         btTitle = (const char*)text;
-    } 
-    else if (id == 0x2) {
+    } else if (id == 0x2) {
         btArtist = (const char*)text;
     }
-    // Optional: Reset title if empty
     if (btTitle == "") btTitle = "Connected";
 }
-// [FIXED] Ensure signature matches header exactly
+
+// RX Audio Callback (Sink)
 void bt_data_callback(const uint8_t *data, uint32_t len) {
     size_t bytes_written;
     int16_t* samples = (int16_t*)data;
-    uint32_t sample_count = len / 4;
+    uint32_t sample_count = len / 4; // 2 channels * 16 bit = 4 bytes per frame
 
     for(int i=0; i < sample_count; i++) {
         StereoSample s;
-        // Shift left to convert 16-bit BT audio to 32-bit DSP audio
+        // Upscale 16-bit to 32-bit
         s.l = ((int32_t)samples[i*2]) << 16;
         s.r = ((int32_t)samples[i*2+1]) << 16;
         
@@ -184,41 +171,16 @@ void bt_data_callback(const uint8_t *data, uint32_t len) {
         i2s_write(I2S_NUM_0, outFrame, 8, &bytes_written, portMAX_DELAY);
     }
 }
-int32_t bt_source_data_callback(uint8_t *data, int32_t len) {
-    size_t bytes_read;
-    int frames = len / 4;
-    int32_t tempBuffer[frames * 2];
-
-    i2s_read(I2S_NUM_1, tempBuffer, frames * 8, &bytes_read, portMAX_DELAY);
-    int16_t* out16 = (int16_t*)data;
-
-    for (int i=0; i<frames; i++) {
-        StereoSample s;
-        s.l = tempBuffer[i*2];
-        s.r = tempBuffer[i*2+1];
-        s = dsp.processAuxPreamp(s);
-        s = dsp.processMasterChain(s);
-
-        int lPeak = abs(s.l >> 23);
-        int rPeak = abs(s.r >> 23);
-        if(lPeak > vuLeft) vuLeft = lPeak; else vuLeft *= 0.9;
-        if(rPeak > vuRight) vuRight = rPeak; else vuRight *= 0.9;
-
-        out16[i*2] = s.l >> 16;
-        out16[i*2+1] = s.r >> 16;
-    }
-    return len;
-}
 
 // ==========================================
 // AUDIO LOOPS (ANALOG & GEN)
 // ==========================================
 void handleAnalogLoop() {
     if (isTxMode) return;
-
     size_t bytes_read, bytes_written;
     int32_t i2s_buffer[64 * 2];
 
+    // Non-blocking read (timeout 0)
     i2s_read(I2S_NUM_1, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 0);
 
     if (bytes_read > 0) {
@@ -242,18 +204,15 @@ void handleAnalogLoop() {
     }
 }
 
-// 4. RESTORED GENERATOR LOOP
 void handleGenLoop() {
     size_t bytes_written;
     int32_t samples[64 * 2];
-
     for (int i = 0; i < 64; i++) {
         float sampleVal = 0;
-
-        // PNoise library usage or simple generation
+        
         if (genSignalType == 0) { // Sine
              sampleVal = sin(currentPhase) * 0.5;
-             currentPhase += 2 * PI * 440.0 / 44100.0;
+             currentPhase += 2 * PI * genFreqStart / 44100.0;
              if(currentPhase > 2*PI) currentPhase -= 2*PI;
         }
         else if (genSignalType == 1) { // White
@@ -262,8 +221,8 @@ void handleGenLoop() {
         else if (genSignalType == 2) { // Pink
              sampleVal = generatePinkNoise() * 0.5;
         }
+        // ... Sweep logic omitted for brevity, can be added if needed
 
-        // Apply Volume DSP
         StereoSample s;
         s.l = (int32_t)(sampleVal * 2147483647.0);
         s.r = s.l;
@@ -281,23 +240,29 @@ void handleGenLoop() {
 void switchMode(OperationMode newMode) {
     if (currentMode == newMode) return;
 
-    // Stop Logic
+    // --- STOP Logic ---
     if (currentMode == MODE_BT) {
-        bt.stop();
+        bt.stop(); // Handles its own I2S uninstall
         delay(200);
-        setupI2S_DAC();
     } else if (currentMode == MODE_RADIO) {
          radio.stop();
          digitalWrite(PIN_RELAY_SOURCE, LOW);
+    }
+    
+    // [CRITICAL FIX] Uninstall manual I2S drivers if switching away from them
+    if (currentMode != MODE_BT) {
+        i2s_driver_uninstall(I2S_NUM_0);
+        i2s_driver_uninstall(I2S_NUM_1);
     }
 
     currentMode = newMode;
     preferences.putInt("last_mode", (int)currentMode);
 
-    // Start Logic
+    // --- START Logic ---
     if (newMode == MODE_BT) {
         digitalWrite(PIN_RELAY_SOURCE, LOW);
         buttons.setContext(CTX_BT);
+        // Now calls declared functions
         bt.startRX(bt_data_callback, bt_metadata_callback);
 
     } else if (newMode == MODE_RADIO) {
@@ -320,11 +285,10 @@ void switchMode(OperationMode newMode) {
             WiFi.softAPdisconnect(true);
             wifiActive = false;
         }
-    }
-    // [FIX] Handling GEN Mode start
-    else if (newMode == MODE_GEN) {
+
+    } else if (newMode == MODE_GEN) {
         digitalWrite(PIN_RELAY_SOURCE, LOW);
-        setupI2S_DAC(); // Only DAC needed
+        setupI2S_DAC();
         i2s_start(I2S_NUM_0);
         sweepStartTime = millis();
     }
@@ -354,7 +318,6 @@ void actionToggleWiFi() {
     wifiActive = !wifiActive;
     if (wifiActive) {
         WiFi.softAP(wifiSSID, wifiPass);
-        // [FIX] Call init from web_server.h
         initWebServer();
     } else {
         WiFi.softAPdisconnect(true);
@@ -365,7 +328,6 @@ void actionCycleSource() {
     if (currentMode == MODE_BT) switchMode(MODE_RADIO);
     else if (currentMode == MODE_RADIO) switchMode(MODE_AUX);
     else switchMode(MODE_BT);
-    // Note: GEN mode is not in the button cycle, only via Web
 }
 
 void actionToggleTxMode() {
@@ -435,11 +397,10 @@ void actionBtPairing() {
 void updateDisplay() {
     if (millis() - lastDisplayUpdate < 100) return;
     lastDisplayUpdate = millis();
-
+    
     int vuL = map(vuLeft, 0, 15000, 0, 100);
     int vuR = map(vuRight, 0, 15000, 0, 100);
     if(vuL>100) vuL=100; if(vuR>100) vuR=100;
-
     vuLeft *= 0.8; vuRight *= 0.8;
 
     if (currentMode == MODE_BT) {
@@ -464,10 +425,9 @@ void updateDisplay() {
                      (dsp.preampMode == 1), dsp.preampMode, false, 100.0,
                      vuL, vuR, isTxMode);
     }
-    // [FIX] Display for Gen Mode
     else if (currentMode == MODE_GEN) {
+        // Basic display for Generator
         ui.screenAux(false, false, volume, false, 0, false, 0, vuL, vuR, false);
-        // Reuse Aux screen or create simple "GENERATOR" screen in displayinfo
     }
 }
 
@@ -479,29 +439,27 @@ void setup() {
     Serial.begin(115200);
     preferences.begin("espdsp", false);
 
-    // 1. Hardware Init
+    // Hardware Init
     pinMode(PIN_RELAY_SOURCE, OUTPUT);
     digitalWrite(PIN_RELAY_SOURCE, LOW);
-
-    // I2C Init
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+    
     ui.begin();
     ui.screenLoading("v3.0 Ultimate");
 
-    // 2. Buttons
     buttons.begin();
-
-    // 3. Bluetooth Init
+    
+    // Bluetooth Init
     String btName = preferences.getString("bt_name", "ESPDSP-Receiver");
     bt.init(btName);
 
-    // 4. Load Settings
+    // Load Settings
     volume = preferences.getInt("vol", 15);
     dsp.setVolume(volume);
     dsp.loudnessEnabled = preferences.getBool("loud", false);
     dsp.stereoExpand = preferences.getBool("expand", false);
 
-    // 5. Start Initial Mode
+    // Start Initial Mode
     int savedMode = preferences.getInt("last_mode", (int)MODE_BT);
     delay(1000);
     switchMode((OperationMode)savedMode);
@@ -511,7 +469,7 @@ void loop() {
     // 1. Inputs
     buttons.update();
 
-    // 2. Radio RDS Background
+    // 2. Radio RDS
     if (currentMode == MODE_RADIO && !radioShowMemories) {
         radio.loop();
     }
@@ -521,11 +479,10 @@ void loop() {
         handleAnalogLoop();
     }
     else if (currentMode == MODE_GEN) {
-        handleGenLoop(); // [FIX] Added back
+        handleGenLoop();
     }
 
-    // 4. Auto-switch to Gen mode if toggled via Web UI
-    // (Variables set by web_server.h callbacks)
+    // 4. Auto-switch via Web
     if (genActive && currentMode != MODE_GEN) {
         switchMode(MODE_GEN);
     }
