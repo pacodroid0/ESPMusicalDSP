@@ -93,7 +93,7 @@ Defined in `pindef.h`:
 
 ---
 
-## 📅 Roadmap (Upcoming FW v3.0)
+## 📅 Roadmap (Upcoming FW v2.0)
 
 The project is currently evolving into a full "Receiver". Planned features for the next release:
 
