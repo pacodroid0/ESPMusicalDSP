@@ -13,7 +13,7 @@
 #include "fmradio.h"
 #include "displayinfo.h"
 #include "phbuttons.h"
-#include "pnoise.h" // Noise Generator
+#include "pnoise.h" 
 
 // --- GLOBAL OBJECTS ---
 Preferences preferences;
@@ -31,10 +31,10 @@ OperationMode currentMode = MODE_BT;
 
 int volume = 15;
 bool wifiActive = false;
-bool isTxMode = false;
+bool isTxMode = false; // Loaded from preferences
 
 // Generator Globals
-int genSignalType = 0; // 0=Sine, 1=White, 2=Pink, 3=Sweep
+int genSignalType = 0; 
 bool genActive = false;
 float genFreqStart = 440.0;
 float genFreqEnd = 440.0;
@@ -53,10 +53,11 @@ int vuRight = 0;
 bool radioShowMemories = false;
 int radioCursor = 1;
 
-// --- WEB SERVER INCLUDE (Must be after Globals) ---
+// --- WEB SERVER ---
 #include "web_server.h"
 
-// --- FORWARD DECLARATIONS (CRITICAL FOR LINKER) ---
+// --- FORWARD DECLARATIONS ---
+void bt_volume_callback(int vol);
 void bt_data_callback(const uint8_t *data, uint32_t len);
 void bt_metadata_callback(uint8_t id, const uint8_t *text);
 int32_t bt_source_data_callback(Frame *data, int32_t frame_count);
@@ -108,7 +109,7 @@ void setupI2S_ADC() {
 // AUDIO CALLBACKS (BLUETOOTH)
 // ==========================================
 
-// TX Callback (Source)
+// [TX MODE] Source Callback - Bypasses Master DSP
 int32_t bt_source_data_callback(Frame *data, int32_t frame_count) {
     size_t bytes_read;
     int32_t tempBuffer[frame_count * 2];
@@ -121,8 +122,14 @@ int32_t bt_source_data_callback(Frame *data, int32_t frame_count) {
         s.l = tempBuffer[i*2];
         s.r = tempBuffer[i*2+1];
 
-        s = dsp.processAuxPreamp(s);
-        s = dsp.processMasterChain(s);
+        // [LOGIC] Only apply RIAA/Dolby if we are actually in AUX mode.
+        // If we are in Radio mode, the signal is already Line Level.
+        if (currentMode == MODE_AUX) {
+            s = dsp.processAuxPreamp(s);
+        }
+        
+        // [BYPASS] No processMasterChain here. 
+        // Signal goes straight to Headphones without EQ/Loudness.
 
         // Update VU
         int lPeak = abs(s.l >> 23);
@@ -137,25 +144,30 @@ int32_t bt_source_data_callback(Frame *data, int32_t frame_count) {
     return frame_count;
 }
 
-// RX Metadata Callback
-void bt_metadata_callback(uint8_t id, const uint8_t *text) {
-    if (id == 0x1) { 
-        btTitle = (const char*)text;
-    } else if (id == 0x2) {
-        btArtist = (const char*)text;
+// [RX MODE] Metadata
+void bt_volume_callback(int vol) {
+    // Map BT volume (0-127) to your system volume (0-30)
+    int newVol = map(vol, 0, 127, 0, 30);
+    if (newVol != volume) {
+        volume = newVol;
+        dsp.setVolume(volume);
+        preferences.putInt("vol", volume); // Optional: Save to memory
     }
+}
+void bt_metadata_callback(uint8_t id, const uint8_t *text) {
+    if (id == 0x1) btTitle = (const char*)text;
+    else if (id == 0x2) btArtist = (const char*)text;
     if (btTitle == "") btTitle = "Connected";
 }
 
-// RX Audio Callback (Sink)
+// [RX MODE] Sink Callback
 void bt_data_callback(const uint8_t *data, uint32_t len) {
     size_t bytes_written;
     int16_t* samples = (int16_t*)data;
-    uint32_t sample_count = len / 4; // 2 channels * 16 bit = 4 bytes per frame
+    uint32_t sample_count = len / 4; 
 
     for(int i=0; i < sample_count; i++) {
         StereoSample s;
-        // Upscale 16-bit to 32-bit
         s.l = ((int32_t)samples[i*2]) << 16;
         s.r = ((int32_t)samples[i*2+1]) << 16;
         
@@ -176,11 +188,13 @@ void bt_data_callback(const uint8_t *data, uint32_t len) {
 // AUDIO LOOPS (ANALOG & GEN)
 // ==========================================
 void handleAnalogLoop() {
-    if (isTxMode) return;
+    // If in TX mode, audio is handled by the BT Callback above, 
+    // NOT by this loop. We return early to avoid I2S conflicts.
+    if (isTxMode) return; 
+
     size_t bytes_read, bytes_written;
     int32_t i2s_buffer[64 * 2];
 
-    // Non-blocking read (timeout 0)
     i2s_read(I2S_NUM_1, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 0);
 
     if (bytes_read > 0) {
@@ -209,25 +223,18 @@ void handleGenLoop() {
     int32_t samples[64 * 2];
     for (int i = 0; i < 64; i++) {
         float sampleVal = 0;
-        
-        if (genSignalType == 0) { // Sine
+        if (genSignalType == 0) { 
              sampleVal = sin(currentPhase) * 0.5;
              currentPhase += 2 * PI * genFreqStart / 44100.0;
              if(currentPhase > 2*PI) currentPhase -= 2*PI;
         }
-        else if (genSignalType == 1) { // White
-             sampleVal = ((float)random(-1000, 1000) / 1000.0) * 0.5;
-        }
-        else if (genSignalType == 2) { // Pink
-             sampleVal = generatePinkNoise() * 0.5;
-        }
-        // ... Sweep logic omitted for brevity, can be added if needed
+        else if (genSignalType == 1) sampleVal = ((float)random(-1000, 1000) / 1000.0) * 0.5;
+        else if (genSignalType == 2) sampleVal = generatePinkNoise() * 0.5;
 
         StereoSample s;
         s.l = (int32_t)(sampleVal * 2147483647.0);
         s.r = s.l;
         s = dsp.processMasterChain(s);
-
         samples[i*2] = s.l;
         samples[i*2+1] = s.r;
     }
@@ -235,40 +242,69 @@ void handleGenLoop() {
 }
 
 // ==========================================
-// MODE SWITCHING LOGIC
+// MODE SWITCHING LOGIC (REBOOT SAFE)
 // ==========================================
 void switchMode(OperationMode newMode) {
-    if (currentMode == newMode) return;
+    if (currentMode == newMode && millis() > 5000) return;
 
-    // --- STOP Logic ---
+    // --- TX MODE LOGIC (Transmitter) ---
+    if (isTxMode) {
+        if (newMode == MODE_BT) newMode = MODE_AUX; // Can't be BT RX in TX mode
+
+        currentMode = newMode;
+        preferences.putInt("last_mode", (int)currentMode);
+
+        if (newMode == MODE_RADIO) {
+            digitalWrite(PIN_RELAY_SOURCE, HIGH);
+            radio.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+            buttons.setContext(CTX_RADIO);
+        } else {
+            digitalWrite(PIN_RELAY_SOURCE, LOW);
+            buttons.setContext(CTX_TX); 
+            if(newMode == MODE_AUX) {
+                 if(wifiActive) { WiFi.softAPdisconnect(true); wifiActive=false; }
+            }
+        }
+
+        // Install ADC ONLY (To read input). No DAC installed = Wired Mute.
+        if (newMode != MODE_GEN) {
+             setupI2S_ADC();
+             i2s_start(I2S_NUM_1);
+        }
+
+        if (!bt.isTransmitting()) {
+            bt.startTX(bt_source_data_callback);
+        }
+        return; 
+    }
+
+    // --- RX MODE LOGIC (Receiver) ---
+    
+    // Stop previous
     if (currentMode == MODE_BT) {
-        bt.stop(); // Handles its own I2S uninstall
+        bt.stop();
         delay(200);
     } else if (currentMode == MODE_RADIO) {
          radio.stop();
          digitalWrite(PIN_RELAY_SOURCE, LOW);
     }
     
-    // [CRITICAL FIX] Uninstall manual I2S drivers if switching away from them
-    if (currentMode != MODE_BT) {
-        i2s_driver_uninstall(I2S_NUM_0);
-        i2s_driver_uninstall(I2S_NUM_1);
-    }
+    // Uninstall drivers to ensure clean switch
+    i2s_driver_uninstall(I2S_NUM_0);
+    i2s_driver_uninstall(I2S_NUM_1);
 
     currentMode = newMode;
     preferences.putInt("last_mode", (int)currentMode);
 
-    // --- START Logic ---
     if (newMode == MODE_BT) {
         digitalWrite(PIN_RELAY_SOURCE, LOW);
         buttons.setContext(CTX_BT);
-        // Now calls declared functions
-        bt.startRX(bt_data_callback, bt_metadata_callback);
+        bt.startRX(bt_data_callback, bt_metadata_callback, bt_volume_callback);
 
     } else if (newMode == MODE_RADIO) {
         digitalWrite(PIN_RELAY_SOURCE, HIGH);
         buttons.setContext(CTX_RADIO);
-        setupI2S_DAC();
+        setupI2S_DAC(); // Wired Sound ON
         setupI2S_ADC();
         i2s_start(I2S_NUM_0);
         i2s_start(I2S_NUM_1);
@@ -277,7 +313,7 @@ void switchMode(OperationMode newMode) {
     } else if (newMode == MODE_AUX) {
         digitalWrite(PIN_RELAY_SOURCE, LOW);
         buttons.setContext(CTX_AUX);
-        setupI2S_DAC();
+        setupI2S_DAC(); // Wired Sound ON
         setupI2S_ADC();
         i2s_start(I2S_NUM_0);
         i2s_start(I2S_NUM_1);
@@ -288,7 +324,7 @@ void switchMode(OperationMode newMode) {
 
     } else if (newMode == MODE_GEN) {
         digitalWrite(PIN_RELAY_SOURCE, LOW);
-        setupI2S_DAC();
+        setupI2S_DAC(); // Wired Sound ON
         i2s_start(I2S_NUM_0);
         sweepStartTime = millis();
     }
@@ -301,13 +337,13 @@ void switchMode(OperationMode newMode) {
 void actionVolUp() {
     if (volume < 30) volume++;
     dsp.setVolume(volume);
-    if(currentMode == MODE_BT) bt.setVolume(volume * 4);
+    if(currentMode == MODE_BT && !isTxMode) bt.setVolume(volume * 4);
     preferences.putInt("vol", volume);
 }
 void actionVolDown() {
     if (volume > 0) volume--;
     dsp.setVolume(volume);
-    if(currentMode == MODE_BT) bt.setVolume(volume * 4);
+    if(currentMode == MODE_BT && !isTxMode) bt.setVolume(volume * 4);
     preferences.putInt("vol", volume);
 }
 void actionVolRapidUp() { actionVolUp(); }
@@ -324,22 +360,37 @@ void actionToggleWiFi() {
     }
 }
 
+// [UPDATED] Smart Cycle: Avoids BT Receiver if we are transmitting
 void actionCycleSource() {
-    if (currentMode == MODE_BT) switchMode(MODE_RADIO);
-    else if (currentMode == MODE_RADIO) switchMode(MODE_AUX);
-    else switchMode(MODE_BT);
+    if (isTxMode) {
+        // Toggle only Radio <-> Aux
+        if (currentMode == MODE_RADIO) switchMode(MODE_AUX);
+        else switchMode(MODE_RADIO); 
+    } else {
+        // Standard Cycle
+        if (currentMode == MODE_BT) switchMode(MODE_RADIO);
+        else if (currentMode == MODE_RADIO) switchMode(MODE_AUX);
+        else switchMode(MODE_BT);
+    }
 }
 
+// [UPDATED] Toggle TX Mode -> Save -> Reboot
 void actionToggleTxMode() {
-    if (currentMode == MODE_BT || currentMode == MODE_GEN) return;
-    isTxMode = !isTxMode;
-    if (isTxMode) {
-        buttons.setContext(CTX_TX);
-        bt.startTX(bt_source_data_callback);
-    } else {
-        bt.stop();
-        buttons.setContext(currentMode == MODE_RADIO ? CTX_RADIO : CTX_AUX);
+    // 1. Toggle State
+    bool newState = !isTxMode;
+    preferences.putBool("tx_mode", newState);
+    
+    // Safety: If forcing OFF from BT RX, next boot must be valid
+    if (currentMode == MODE_BT) {
+        preferences.putInt("last_mode", (int)MODE_AUX);
     }
+
+    // 2. Notify User
+    ui.screenLoading(newState ? "Rebooting to TX..." : "Rebooting to RX...");
+    
+    // 3. Reboot
+    delay(1000);
+    ESP.restart();
 }
 
 // --- RADIO ACTIONS ---
@@ -387,7 +438,7 @@ void actionToggleLoudness() {
     preferences.putBool("loud", dsp.loudnessEnabled);
 }
 void actionBtPairing() {
-    if (currentMode == MODE_BT) bt.disconnectRX();
+    if (currentMode == MODE_BT && !isTxMode) bt.disconnectRX();
 }
 
 
@@ -426,7 +477,6 @@ void updateDisplay() {
                      vuL, vuR, isTxMode);
     }
     else if (currentMode == MODE_GEN) {
-        // Basic display for Generator
         ui.screenAux(false, false, volume, false, 0, false, 0, vuL, vuR, false);
     }
 }
@@ -439,17 +489,19 @@ void setup() {
     Serial.begin(115200);
     preferences.begin("espdsp", false);
 
+    // 1. READ TX MODE PREFERENCE
+    isTxMode = preferences.getBool("tx_mode", false);
+
     // Hardware Init
     pinMode(PIN_RELAY_SOURCE, OUTPUT);
     digitalWrite(PIN_RELAY_SOURCE, LOW);
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     
     ui.begin();
-    ui.screenLoading("v3.0 Ultimate");
+    ui.screenLoading(isTxMode ? "TX Mode (Headphones)" : "RX Mode (Speaker)");
 
     buttons.begin();
     
-    // Bluetooth Init
     String btName = preferences.getString("bt_name", "ESPDSP-Receiver");
     bt.init(btName);
 
@@ -466,15 +518,12 @@ void setup() {
 }
 
 void loop() {
-    // 1. Inputs
     buttons.update();
 
-    // 2. Radio RDS
     if (currentMode == MODE_RADIO && !radioShowMemories) {
         radio.loop();
     }
 
-    // 3. Audio Loop
     if (currentMode == MODE_AUX || currentMode == MODE_RADIO) {
         handleAnalogLoop();
     }
@@ -482,7 +531,6 @@ void loop() {
         handleGenLoop();
     }
 
-    // 4. Auto-switch via Web
     if (genActive && currentMode != MODE_GEN) {
         switchMode(MODE_GEN);
     }
@@ -490,9 +538,6 @@ void loop() {
         switchMode(MODE_BT);
     }
 
-    // 5. UI
     updateDisplay();
-
-    // 6. WiFi
     if (wifiActive) server.handleClient();
 }

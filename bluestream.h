@@ -24,10 +24,13 @@ public:
     // ==========================================
     // RX MODE (SINK) - Smartphone -> ESP32
     // ==========================================
-    // data_cb: Funzione che riceve l'audio (bt_data_callback in audiocb.h)
-    // meta_cb: Funzione opzionale per leggere Titolo/Artista (per il Display)
-    // [FIXED] Updated signature: id is now uint8_t (not pointer), and fixed parens syntax
-    void startRX(void (*data_cb)(const uint8_t*, uint32_t), void (*meta_cb)(uint8_t, const uint8_t*) = nullptr) {
+    // data_cb: Funzione che riceve l'audio (bt_data_callback)
+    // meta_cb: Funzione opzionale per leggere Titolo/Artista
+    // vol_cb:  [NEW] Funzione opzionale per sincronizzare il volume (Telefono -> ESP32)
+    void startRX(void (*data_cb)(const uint8_t*, uint32_t), 
+                 void (*meta_cb)(uint8_t, const uint8_t*) = nullptr,
+                 void (*vol_cb)(int) = nullptr) {
+        
         // Se eravamo in TX, spegni tutto
         if (isTxMode) stop();
         isTxMode = false;
@@ -38,6 +41,11 @@ public:
         // Configura Callback Metadata (opzionale per Display)
         if (meta_cb != nullptr) {
             sink.set_avrc_metadata_callback(meta_cb);
+        }
+
+        // [NEW] Configura Callback Volume (opzionale per sincronizzazione)
+        if (vol_cb != nullptr) {
+            sink.set_avrc_rn_volumechange(vol_cb);
         }
 
         // Avvia
@@ -57,8 +65,7 @@ public:
     // TX MODE (SOURCE) - ESP32 -> Headphones
     // ==========================================
     // provider_cb: Funzione che fornisce l'audio (legge ADC -> DSP -> BT)
-    // targetName: (Opzionale) Nome cuffie a cui connettersi. Se vuoto, cerca l'ultimo o il più forte.
-    // [FIXED] Updated signature: data is now Frame* (not uint8_t*)
+    // targetName: (Opzionale) Nome cuffie a cui connettersi.
     void startTX(int32_t (*provider_cb)(Frame*, int32_t), String targetName = "") {
         // Se eravamo in RX, spegni tutto
         if (!isTxMode) stop();
@@ -66,9 +73,6 @@ public:
 
         // Configurazione Source
         source.set_auto_reconnect(true);
-
-        // Se volessimo filtrare per nome (richiede logica callback ssid extra),
-        // per ora usiamo la connessione standard automatica.
 
         // Avvia con la callback che fornisce i dati
         source.start(provider_cb);
@@ -96,7 +100,7 @@ public:
         return isTxMode;
     }
 
-    // Volume pass-through (se gestito dalla lib BT e non dal DSP)
+    // Volume pass-through
     void setVolume(uint8_t vol) {
         if (!isTxMode) sink.set_volume(vol);
         else source.set_volume(vol);
